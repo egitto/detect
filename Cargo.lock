@@ -306,6 +306,7 @@ dependencies = [
  "clap",
  "futures",
  "ignore",
+ "libc",
  "miette",
  "pest",
  "pest_derive",

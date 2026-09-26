@@ -9,6 +9,7 @@ use std::ops::{RangeFrom, RangeTo};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::prelude::MetadataExt;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     fmt::{self, Display},
     fs::Metadata,
@@ -19,7 +20,7 @@ use std::{
 use crate::expr::short_circuit::ShortCircuit;
 use crate::predicate_error::PredicateParseError;
 use crate::util::Done;
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, NaiveDate, TimeZone};
 
 /// File type enumeration for type predicates
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -238,21 +239,37 @@ pub enum TimeMatcher {
 }
 
 impl TimeMatcher {
-    pub fn is_match(&self, timestamp: i64) -> bool {
-        use std::time::UNIX_EPOCH;
-
-        let file_time = UNIX_EPOCH + std::time::Duration::from_secs(timestamp as u64);
-        let file_datetime: DateTime<Local> = file_time.into();
-
+    pub fn is_match(&self, file_time: SystemTime) -> bool {
+        // compare as SystemTime: file times can lie outside chrono's range
         match self {
-            TimeMatcher::Before(dt) => file_datetime < *dt,
-            TimeMatcher::After(dt) => file_datetime > *dt,
-            TimeMatcher::BeforeOrEqual(dt) => file_datetime <= *dt,
-            TimeMatcher::AfterOrEqual(dt) => file_datetime >= *dt,
-            TimeMatcher::Equals(dt) => file_datetime.date_naive() == dt.date_naive(),
-            TimeMatcher::NotEquals(dt) => file_datetime.date_naive() != dt.date_naive(),
+            TimeMatcher::Before(dt) => file_time < SystemTime::from(*dt),
+            TimeMatcher::After(dt) => file_time > SystemTime::from(*dt),
+            TimeMatcher::BeforeOrEqual(dt) => file_time <= SystemTime::from(*dt),
+            TimeMatcher::AfterOrEqual(dt) => file_time >= SystemTime::from(*dt),
+            TimeMatcher::Equals(dt) => local_date(file_time) == local_date(SystemTime::from(*dt)),
+            TimeMatcher::NotEquals(dt) => {
+                local_date(file_time) != local_date(SystemTime::from(*dt))
+            }
         }
     }
+}
+
+/// Local calendar date of `t`, or None if chrono can't represent it
+fn local_date(t: SystemTime) -> Option<NaiveDate> {
+    let (secs, nanos) = match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => (i64::try_from(d.as_secs()).ok()?, d.subsec_nanos()),
+        Err(e) => {
+            let d = e.duration();
+            let secs = -i64::try_from(d.as_secs()).ok()?;
+            match d.subsec_nanos() {
+                0 => (secs, 0),
+                n => (secs.checked_sub(1)?, 1_000_000_000 - n),
+            }
+        }
+    };
+    let utc = DateTime::from_timestamp(secs, nanos)?.naive_utc();
+    let offset = Local.offset_from_utc_datetime(&utc);
+    Some(utc.checked_add_offset(offset)?.date())
 }
 
 impl NumberMatcher {
@@ -671,9 +688,16 @@ impl MetadataPredicate {
                     false
                 }
             }
-            MetadataPredicate::Modified(matcher) => matcher.is_match(metadata.mtime()),
-            MetadataPredicate::Created(matcher) => matcher.is_match(metadata.ctime()),
-            MetadataPredicate::Accessed(matcher) => matcher.is_match(metadata.atime()),
+            // timestamps unsupported by the platform/filesystem never match
+            MetadataPredicate::Modified(matcher) => {
+                metadata.modified().is_ok_and(|t| matcher.is_match(t))
+            }
+            MetadataPredicate::Created(matcher) => {
+                metadata.created().is_ok_and(|t| matcher.is_match(t))
+            }
+            MetadataPredicate::Accessed(matcher) => {
+                metadata.accessed().is_ok_and(|t| matcher.is_match(t))
+            }
         }
     }
 }

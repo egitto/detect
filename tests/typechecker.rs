@@ -384,7 +384,7 @@ fn test_selector_aliases() {
     );
 
     assert_eq!(
-        parse_and_typecheck("ctime < 2024-12-31").unwrap(),
+        parse_and_typecheck("btime < 2024-12-31").unwrap(),
         parse_and_typecheck("created < 2024-12-31").unwrap()
     );
 

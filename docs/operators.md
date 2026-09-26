@@ -41,8 +41,8 @@ For: `modified`, `created`, `accessed`
 | `<`      | Before (older than) | `created < 2024-01-01` |
 | `>=`     | At or after | `modified >= -1w` |
 | `<=`     | At or before | `accessed <= -1d` |
-| `==`     | Exact time | `modified == 2024-01-15` |
-| `!=`     | Not at time | `created != 2024-01-01` |
+| `==`     | Same local calendar day | `modified == 2024-01-15` |
+| `!=`     | Different local calendar day | `created != 2024-01-01` |
 
 **Formats:** Relative `-7d`, `-2h`, `-30m`, `-1w` (units: `s`, `m`/`min`, `h`/`hr`, `d`/`day`, `w`/`week`, with plurals). Absolute `2024-01-15`, `2024-01-15T10:30:00`.
 

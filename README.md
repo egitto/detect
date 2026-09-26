@@ -95,11 +95,13 @@ detect 'yaml:.server.port > 8000 AND size < 0.5mb'   # structured data
 
 **File types** (case-insensitive): `file`, `dir`/`directory`, `symlink`/`link`, `socket`/`sock`, `fifo`/`pipe`, `block`/`blockdev`, `char`/`chardev`
 
+**Symlinks** are not followed by default (like `find`, `fd`, `rg`): a link is `type == symlink`, `size` is the link's own size, and content/structured predicates don't match it. Pass `-L` to follow links and evaluate predicates against their targets.
+
 #### Timestamps
 | Selector | Type | Description | Example |
 |----------|------|-------------|---------|
 | `modified` / `mtime` | Temporal | Last modification time | `modified > -7d` |
-| `created` / `ctime` | Temporal | File creation time | `created > 2024-01-01` |
+| `created` / `btime` | Temporal | File creation (birth) time; never matches (and `NOT created ...` always matches) where the filesystem doesn't record it | `created > 2024-01-01` |
 | `accessed` / `atime` | Temporal | Last access time | `accessed < -1h` |
 
 **Time formats:** Relative `-7d`/`-7days`, `-2h`/`-2hours`, `-1w`/`-1week` (units: `s`, `m`/`min`, `h`/`hr`, `d`/`day`, `w`/`week` + plurals). Absolute `2024-01-15`, `2024-01-15T10:30:00`.
@@ -163,6 +165,7 @@ find . -name "*.ts" -size +1M -mtime -7  →  detect 'ext == ts AND size > 1mb A
 # CLI options
 detect 'ext == rs' ./src                              # search specific directory
 detect -i 'content contains SECRET'                   # include gitignored files
+detect -L 'content contains TODO'                     # follow symlinks
 detect --max-structured-size 50mb 'yaml:.config'      # configure size limit for structured files
 ```
 

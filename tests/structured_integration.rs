@@ -1315,6 +1315,7 @@ async fn test_structured_skipped_when_file_exceeds_size_limit() {
     // large_config.yaml is >200 bytes, so it should be skipped
     let config = detect::RuntimeConfig {
         max_structured_size: 50,
+        ..Default::default()
     };
 
     // Query that would match if file were parsed

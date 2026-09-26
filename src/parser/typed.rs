@@ -134,7 +134,7 @@ pub enum NumericSelector {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TemporalSelector {
     Modified, // modified, mtime, mod, modification
-    Created,  // created, ctime, birth, birthtime
+    Created,  // created, btime (birth time, not inode change time)
     Accessed, // accessed, atime, access
 }
 
@@ -287,7 +287,7 @@ pub fn recognize_selector(s: &str) -> Result<SelectorCategory, ParseError> {
 
         // Time (3) + common Unix aliases
         "modified" | "mtime" => Ok(SelectorCategory::Temporal(TemporalSelector::Modified)),
-        "created" | "ctime" => Ok(SelectorCategory::Temporal(TemporalSelector::Created)),
+        "created" | "btime" => Ok(SelectorCategory::Temporal(TemporalSelector::Created)),
         "accessed" | "atime" => Ok(SelectorCategory::Temporal(TemporalSelector::Accessed)),
 
         // Content (1) + aliases

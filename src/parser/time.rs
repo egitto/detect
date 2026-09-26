@@ -9,16 +9,19 @@ fn parse_duration(
     unit: &str,
     original: &str,
 ) -> Result<Duration, PredicateParseError> {
-    match unit {
-        "seconds" | "second" | "secs" | "sec" | "s" => Ok(Duration::seconds(number)),
-        "minutes" | "minute" | "mins" | "min" | "m" => Ok(Duration::minutes(number)),
-        "hours" | "hour" | "hrs" | "hr" | "h" => Ok(Duration::hours(number)),
-        "days" | "day" | "d" => Ok(Duration::days(number)),
-        "weeks" | "week" | "w" => Ok(Duration::weeks(number)),
-        _ => Err(PredicateParseError::Temporal(format!(
-            "{original}: unknown unit: {unit}"
-        ))),
-    }
+    let duration = match unit {
+        "seconds" | "second" | "secs" | "sec" | "s" => Duration::try_seconds(number),
+        "minutes" | "minute" | "mins" | "min" | "m" => Duration::try_minutes(number),
+        "hours" | "hour" | "hrs" | "hr" | "h" => Duration::try_hours(number),
+        "days" | "day" | "d" => Duration::try_days(number),
+        "weeks" | "week" | "w" => Duration::try_weeks(number),
+        _ => {
+            return Err(PredicateParseError::Temporal(format!(
+                "{original}: unknown unit: {unit}"
+            )))
+        }
+    };
+    duration.ok_or_else(|| PredicateParseError::Temporal(format!("{original}: out of range")))
 }
 
 /// Try to parse input as a relative time (e.g., "7d", "3.hours")
@@ -113,11 +116,13 @@ pub fn parse_time_value(s: &str) -> Result<DateTime<Local>, PredicateParseError>
     // Try parsing as relative time first
     match parse_relative_time(input, s) {
         Ok(duration) => {
-            return if is_past {
-                Ok(Local::now() - duration)
+            let now = Local::now();
+            let time = if is_past {
+                now.checked_sub_signed(duration)
             } else {
-                Ok(Local::now() + duration)
+                now.checked_add_signed(duration)
             };
+            return time.ok_or_else(|| PredicateParseError::Temporal(format!("{s}: out of range")));
         }
         Err(e) => {
             // If it failed but looks like it was meant to be a relative time,

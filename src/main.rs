@@ -1,4 +1,9 @@
-use std::{env::current_dir, io::Write, path::PathBuf, str::FromStr};
+use std::{
+    env::current_dir,
+    io::Write,
+    path::{Component, Path, PathBuf},
+    str::FromStr,
+};
 
 use clap::Parser;
 use detect::{parse_and_run_fs, RuntimeConfig};
@@ -44,6 +49,9 @@ struct Args {
     /// include gitignored files
     #[arg(short = 'i')]
     visit_gitignored: bool,
+    /// follow symbolic links, evaluating predicates against their targets
+    #[arg(short = 'L', long = "follow")]
+    follow_links: bool,
     /// log level (trace/debug/info/warning/error/critical)
     #[arg(short = 'l', default_value = "warning")]
     log_level: String,
@@ -95,6 +103,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = RuntimeConfig {
         max_structured_size,
+        follow_links: args.follow_links,
     };
 
     let log_level = Level::from_str(&args.log_level).unwrap_or_else(|_| {
@@ -105,7 +114,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     });
 
-    let plain = slog_term::PlainSyncDecorator::new(std::io::stdout());
+    let plain = slog_term::PlainSyncDecorator::new(std::io::stderr());
     let logger = Logger::root(
         RuntimeLevelFilter {
             drain: slog_term::FullFormat::new(plain).build(),
@@ -120,11 +129,6 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => current_dir()?,
     };
 
-    // Canonicalize root path for relative path computation
-    let canonical_root = root_path
-        .canonicalize()
-        .unwrap_or_else(|_| root_path.clone());
-
     let mut output = std::io::stdout();
 
     let result = parse_and_run_fs(
@@ -134,12 +138,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         expr,
         config,
         |s| {
-            let display_path = s
-                .strip_prefix(&canonical_root)
-                .unwrap_or(s)
-                .to_string_lossy();
-
-            if let Err(e) = writeln!(output, "./{}", display_path) {
+            if let Err(e) = writeln!(output, "{}", display_path(&root_path, s)) {
                 if e.kind() == std::io::ErrorKind::BrokenPipe {
                     // Unix convention: exit 0 on SIGPIPE/BrokenPipe
                     std::process::exit(0);
@@ -189,5 +188,23 @@ where
         } else {
             Ok(None)
         }
+    }
+}
+
+/// Absolute roots (including the default, the current dir) print paths
+/// relative to the root; relative roots print paths relative to the current
+/// dir, as walked. Either way paths are prefixed with `./` unless they already
+/// start with `.` or `..`.
+fn display_path(root: &Path, path: &Path) -> String {
+    let path = if root.is_absolute() {
+        path.strip_prefix(root).unwrap_or(path)
+    } else {
+        path
+    };
+    match path.components().next() {
+        Some(Component::CurDir | Component::ParentDir | Component::RootDir) => {
+            path.display().to_string()
+        }
+        _ => format!("./{}", path.display()),
     }
 }

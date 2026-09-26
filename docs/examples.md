@@ -3,7 +3,7 @@
 **Quick tips:**
 - Start with cheap filters (`ext`, `size`, `type`) before expensive ones (`content`, structured)
 - Quote expressions with spaces/special chars: `'ext == rs AND content ~= "async "'`
-- Use `-i` to include gitignored files
+- Use `-i` to include gitignored files, `-L` to follow symlinks
 
 ## Progressive Examples
 

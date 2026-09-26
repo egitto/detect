@@ -22,12 +22,16 @@ pub struct RuntimeConfig {
     /// Maximum file size (in bytes) for structured data parsing (YAML/JSON/TOML)
     /// Files larger than this will skip structured data evaluation
     pub max_structured_size: u64,
+    /// Follow symbolic links while walking and evaluate predicates against
+    /// their targets (like `find -L`)
+    pub follow_links: bool,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             max_structured_size: 10 * 1024 * 1024, // 10MB default
+            follow_links: false,
         }
     }
 }
@@ -60,6 +64,7 @@ pub async fn parse_and_run_fs<F: FnMut(&Path)>(
             let walker = WalkBuilder::new(root)
                 .hidden(false)
                 .git_ignore(respect_gitignore)
+                .follow_links(config.follow_links)
                 .filter_entry(|entry| {
                     // Always exclude VCS directories, regardless of gitignore settings
                     // This matches ripgrep's behavior
@@ -82,14 +87,14 @@ pub async fn parse_and_run_fs<F: FnMut(&Path)>(
             let mut match_count = 0;
             for entry in walker {
                 let entry = match entry {
-                    Ok(e) => e,
+                    Ok(e) => e.into_path(),
                     Err(e) => {
                         // Skip entries we can't access (permission denied, etc.)
                         warn!(logger, "skipping entry due to walker error"; "error" => %e);
                         continue;
                     }
                 };
-                let path = entry.path();
+                let path = entry.as_path();
 
                 if path == root {
                     continue;
@@ -97,7 +102,15 @@ pub async fn parse_and_run_fs<F: FnMut(&Path)>(
 
                 let start = Instant::now();
 
-                let is_match = match eval::fs::eval(&logger, &expr, path, Some(root)).await {
+                let is_match = match eval::fs::eval(
+                    &logger,
+                    &expr,
+                    path,
+                    Some(root),
+                    config.follow_links,
+                )
+                .await
+                {
                     Ok(result) => result,
                     Err(e) => {
                         // Handle I/O errors gracefully - skip files we can't access

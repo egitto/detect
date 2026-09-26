@@ -6,9 +6,10 @@ use crate::predicate::{
 use crate::util::Done;
 use futures::{stream, TryStreamExt};
 use slog::{debug, o, Logger};
+use std::fs::Metadata;
 use std::path::Path;
-use tokio::fs::File;
-use tokio::io::BufStream;
+use tokio::fs::{File, OpenOptions};
+use tokio::io::{AsyncReadExt, BufStream};
 use tokio_util::io::ReaderStream;
 
 use crate::eval::run_contents_predicate_stream;
@@ -25,6 +26,7 @@ pub async fn eval<'dfa>(
     >,
     path: &Path,
     base_path: Option<&Path>,
+    follow_links: bool,
 ) -> std::io::Result<bool> {
     let logger = logger.new(o!("path" => format!("{:?}", path)));
 
@@ -40,8 +42,9 @@ pub async fn eval<'dfa>(
 
     debug!(logger, "reduced expr after path predicate eval";  "expr" => %e);
 
-    let file = File::open(path).await?;
-    let metadata = file.metadata().await?;
+    // stat without opening: opening a FIFO blocks, and metadata shouldn't need
+    // read access. Only follow symlinks if the walker does.
+    let metadata = entry_metadata(path, follow_links).await?;
 
     let e: Expr<Predicate<Done, Done, StreamingCompiledContentPredicateRef<'dfa>>> =
         e.reduce_predicate_and_short_circuit(|p| p.eval_metadata_predicate(&metadata));
@@ -57,7 +60,13 @@ pub async fn eval<'dfa>(
     let has_structured = e.contains_structured_predicates();
     let has_content = e.contains_content_predicates();
 
-    if !metadata.is_file() {
+    let file = if metadata.is_file() {
+        open_regular_file(path, follow_links).await?
+    } else {
+        None
+    };
+
+    let Some(file) = file else {
         debug!(
             logger,
             "not a file, all structured/content predicates eval to false"
@@ -76,7 +85,7 @@ pub async fn eval<'dfa>(
             return Ok(b);
         }
         unreachable!("all predicates should be reduced to literals after evaluation")
-    }
+    };
 
     match (has_structured, has_content) {
         (true, true) => {
@@ -84,7 +93,7 @@ pub async fn eval<'dfa>(
                 logger,
                 "evaluating both structured and content predicates - single file read"
             );
-            let bytes = tokio::fs::read(path).await?;
+            let bytes = read_all(file).await?;
 
             if let Ok(contents) = std::str::from_utf8(&bytes) {
                 // UTF-8: evaluate structured predicates first
@@ -159,8 +168,9 @@ pub async fn eval<'dfa>(
         }
         (true, false) => {
             debug!(logger, "evaluating structured predicates only");
-            let e = match tokio::fs::read_to_string(path).await {
-                Ok(contents) => {
+            let contents = read_all(file).await.map(String::from_utf8);
+            let e = match contents {
+                Ok(Ok(contents)) => {
                     let mut cache = ParsedDocuments::new();
                     e.reduce_predicate_and_short_circuit(|p| match p {
                         Predicate::Structured(s) => {
@@ -176,7 +186,7 @@ pub async fn eval<'dfa>(
                         ),
                     })
                 }
-                Err(_) => {
+                Ok(Err(_)) | Err(_) => {
                     // Non-UTF-8 or read error: all structured predicates = false
                     e.reduce_predicate_and_short_circuit(|p| match p {
                         Predicate::Structured(_) => {
@@ -220,4 +230,41 @@ pub async fn eval<'dfa>(
             )
         }
     }
+}
+
+async fn entry_metadata(path: &Path, follow_links: bool) -> std::io::Result<Metadata> {
+    if follow_links {
+        tokio::fs::metadata(path).await
+    } else {
+        tokio::fs::symlink_metadata(path).await
+    }
+}
+
+/// Open `path` for reading only if it is (still) a regular file. O_NONBLOCK
+/// keeps the open from hanging if the entry was swapped for a FIFO after it
+/// was stat'ed; it has no effect on reads from regular files.
+async fn open_regular_file(path: &Path, follow_links: bool) -> std::io::Result<Option<File>> {
+    let mut flags = libc::O_NONBLOCK | libc::O_NOCTTY;
+    if !follow_links {
+        flags |= libc::O_NOFOLLOW;
+    }
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
+        .await
+    {
+        Ok(file) => file,
+        // swapped for a symlink since it was stat'ed
+        // (Linux reports ELOOP, FreeBSD EMLINK)
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::EMLINK)) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    Ok(file.metadata().await?.is_file().then_some(file))
+}
+
+async fn read_all(mut file: File) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).await?;
+    Ok(bytes)
 }
