@@ -4,22 +4,20 @@ use crate::predicate::{
     MetadataPredicate, NamePredicate, Predicate, StreamingCompiledContentPredicateRef,
 };
 use crate::util::Done;
-use futures::{stream, TryStreamExt};
 use slog::{debug, o, Logger};
-use std::fs::Metadata;
+use std::fs::{File, Metadata, OpenOptions};
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, BufStream};
-use tokio_util::io::ReaderStream;
 
-use crate::eval::run_contents_predicate_stream;
+use crate::eval::run_contents_predicate;
 use crate::eval::structured::{eval_structured_predicate, ParsedDocuments};
 
 /// multipass evaluation with short circuiting, runs, in order:
 /// - file name matchers
 /// - metadata matchers
 /// - file content matchers
-pub async fn eval<'dfa>(
+pub fn eval<'dfa>(
     logger: &Logger,
     e: &'dfa Expr<
         Predicate<NamePredicate, MetadataPredicate, StreamingCompiledContentPredicateRef<'dfa>>,
@@ -44,7 +42,7 @@ pub async fn eval<'dfa>(
 
     // stat without opening: opening a FIFO blocks, and metadata shouldn't need
     // read access. Only follow symlinks if the walker does.
-    let metadata = entry_metadata(path, follow_links).await?;
+    let metadata = entry_metadata(path, follow_links)?;
 
     let e: Expr<Predicate<Done, Done, StreamingCompiledContentPredicateRef<'dfa>>> =
         e.reduce_predicate_and_short_circuit(|p| p.eval_metadata_predicate(&metadata));
@@ -61,7 +59,7 @@ pub async fn eval<'dfa>(
     let has_content = e.contains_content_predicates();
 
     let file = if metadata.is_file() {
-        open_regular_file(path, follow_links).await?
+        open_regular_file(path, follow_links)?
     } else {
         None
     };
@@ -93,7 +91,7 @@ pub async fn eval<'dfa>(
                 logger,
                 "evaluating both structured and content predicates - single file read"
             );
-            let bytes = read_all(file).await?;
+            let bytes = read_all(file)?;
 
             if let Ok(contents) = std::str::from_utf8(&bytes) {
                 // UTF-8: evaluate structured predicates first
@@ -114,14 +112,8 @@ pub async fn eval<'dfa>(
                     return Ok(b);
                 }
 
-                // Evaluate content predicates using in-memory stream (8KB chunks)
-                const CHUNK_SIZE: usize = 8192;
-                let chunks: Vec<Result<Vec<u8>, std::io::Error>> = bytes
-                    .chunks(CHUNK_SIZE)
-                    .map(|chunk| Ok(chunk.to_vec()))
-                    .collect();
-
-                let e = run_contents_predicate_stream(e, stream::iter(chunks)).await?;
+                // Evaluate content predicates against the bytes already read
+                let e = run_contents_predicate(e, &bytes[..])?;
 
                 if let Expr::Literal(b) = e {
                     debug!(logger, "evaluation finished"; "result" => b);
@@ -148,13 +140,7 @@ pub async fn eval<'dfa>(
                     return Ok(b);
                 }
 
-                const CHUNK_SIZE: usize = 8192;
-                let chunks: Vec<Result<Vec<u8>, std::io::Error>> = bytes
-                    .chunks(CHUNK_SIZE)
-                    .map(|chunk| Ok(chunk.to_vec()))
-                    .collect();
-
-                let e = run_contents_predicate_stream(e, stream::iter(chunks)).await?;
+                let e = run_contents_predicate(e, &bytes[..])?;
 
                 if let Expr::Literal(b) = e {
                     debug!(logger, "evaluation finished"; "result" => b);
@@ -168,7 +154,7 @@ pub async fn eval<'dfa>(
         }
         (true, false) => {
             debug!(logger, "evaluating structured predicates only");
-            let contents = read_all(file).await.map(String::from_utf8);
+            let contents = read_all(file).map(String::from_utf8);
             let e = match contents {
                 Ok(Ok(contents)) => {
                     let mut cache = ParsedDocuments::new();
@@ -210,11 +196,7 @@ pub async fn eval<'dfa>(
         }
         (false, true) => {
             debug!(logger, "evaluating content predicates only - streaming");
-            let e = run_contents_predicate_stream(
-                e,
-                ReaderStream::new(BufStream::new(file)).map_ok(|b| b.to_vec()),
-            )
-            .await?;
+            let e = run_contents_predicate(e, file)?;
 
             if let Expr::Literal(b) = e {
                 debug!(logger, "evaluation finished"; "result" => b);
@@ -232,39 +214,34 @@ pub async fn eval<'dfa>(
     }
 }
 
-async fn entry_metadata(path: &Path, follow_links: bool) -> std::io::Result<Metadata> {
+fn entry_metadata(path: &Path, follow_links: bool) -> std::io::Result<Metadata> {
     if follow_links {
-        tokio::fs::metadata(path).await
+        std::fs::metadata(path)
     } else {
-        tokio::fs::symlink_metadata(path).await
+        std::fs::symlink_metadata(path)
     }
 }
 
 /// Open `path` for reading only if it is (still) a regular file. O_NONBLOCK
 /// keeps the open from hanging if the entry was swapped for a FIFO after it
 /// was stat'ed; it has no effect on reads from regular files.
-async fn open_regular_file(path: &Path, follow_links: bool) -> std::io::Result<Option<File>> {
+fn open_regular_file(path: &Path, follow_links: bool) -> std::io::Result<Option<File>> {
     let mut flags = libc::O_NONBLOCK | libc::O_NOCTTY;
     if !follow_links {
         flags |= libc::O_NOFOLLOW;
     }
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(flags)
-        .open(path)
-        .await
-    {
+    let file = match OpenOptions::new().read(true).custom_flags(flags).open(path) {
         Ok(file) => file,
         // swapped for a symlink since it was stat'ed
         // (Linux reports ELOOP, FreeBSD EMLINK)
         Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::EMLINK)) => return Ok(None),
         Err(e) => return Err(e),
     };
-    Ok(file.metadata().await?.is_file().then_some(file))
+    Ok(file.metadata()?.is_file().then_some(file))
 }
 
-async fn read_all(mut file: File) -> std::io::Result<Vec<u8>> {
+fn read_all(mut file: File) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).await?;
+    file.read_to_end(&mut bytes)?;
     Ok(bytes)
 }

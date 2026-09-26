@@ -9,11 +9,19 @@ pub mod predicate;
 mod predicate_error;
 pub mod util;
 
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{
+    panic::{self, AssertUnwindSafe},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
-use ignore::WalkBuilder;
+use expr::Expr;
+use ignore::{WalkBuilder, WalkState};
 use parser::{error::DetectError, RawParser, Typechecker};
-use predicate::Predicate;
+use predicate::{
+    MetadataPredicate, NamePredicate, Predicate, StreamingCompiledContentPredicateRef,
+};
 use slog::{debug, info, warn, Logger};
 
 /// Runtime configuration for detect operations
@@ -36,6 +44,8 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// Walks `root` in parallel, calling `on_match` (on the calling thread) for
+/// each matching entry, in no particular order. Blocks while walking.
 pub async fn parse_and_run_fs<F: FnMut(&Path)>(
     logger: Logger,
     root: &Path,
@@ -73,7 +83,7 @@ pub async fn parse_and_run_fs<F: FnMut(&Path)>(
                         .to_str()
                         .is_some_and(|s| s == ".git" || s == ".hg" || s == ".svn")
                 })
-                .build();
+                .build_parallel();
 
             let expr = parsed_expr.map_predicate_ref(|p| match p {
                 Predicate::Name(n) => Predicate::Name(Arc::clone(n)),
@@ -84,54 +94,52 @@ pub async fn parse_and_run_fs<F: FnMut(&Path)>(
 
             info!(logger, "parsed expression"; "expr" => %expr);
 
+            // Walk and evaluate in parallel, funnelling matches back to this
+            // thread so `on_match` needn't be Send
+            let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+            let worker_panic = Mutex::new(None);
             let mut match_count = 0;
-            for entry in walker {
-                let entry = match entry {
-                    Ok(e) => e.into_path(),
-                    Err(e) => {
-                        // Skip entries we can't access (permission denied, etc.)
-                        warn!(logger, "skipping entry due to walker error"; "error" => %e);
-                        continue;
-                    }
-                };
-                let path = entry.as_path();
+            std::thread::scope(|scope| {
+                let (expr, logger, worker_panic) = (&expr, &logger, &worker_panic);
+                scope.spawn(move || {
+                    walker.run(|| {
+                        let tx = tx.clone();
+                        Box::new(move |entry| {
+                            let path = match entry {
+                                Ok(e) => e.into_path(),
+                                Err(e) => {
+                                    // Skip entries we can't access (permission denied, etc.)
+                                    warn!(logger, "skipping entry due to walker error"; "error" => %e);
+                                    return WalkState::Continue;
+                                }
+                            };
+                            if path == root {
+                                return WalkState::Continue;
+                            }
+                            // a panicking worker would leave the others waiting on it
+                            // forever, so stop the walk and re-raise it afterwards
+                            let visited = panic::catch_unwind(AssertUnwindSafe(|| {
+                                visit(logger, expr, &path, root, config.follow_links)
+                            }));
+                            match visited {
+                                Ok(true) if tx.send(path).is_err() => WalkState::Quit,
+                                Ok(_) => WalkState::Continue,
+                                Err(payload) => {
+                                    worker_panic.lock().unwrap().get_or_insert(payload);
+                                    WalkState::Quit
+                                }
+                            }
+                        })
+                    });
+                });
 
-                if path == root {
-                    continue;
-                }
-
-                let start = Instant::now();
-
-                let is_match = match eval::fs::eval(
-                    &logger,
-                    &expr,
-                    path,
-                    Some(root),
-                    config.follow_links,
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(e) => {
-                        // Handle I/O errors gracefully - skip files we can't access
-                        if e.kind() == std::io::ErrorKind::PermissionDenied {
-                            debug!(logger, "skipping file due to permission denied"; "path" => #?path);
-                            continue;
-                        }
-                        // For other I/O errors, also skip but log at warning level
-                        warn!(logger, "skipping file due to I/O error"; "path" => #?path, "error" => %e);
-                        continue;
-                    }
-                };
-
-                let duration = start.elapsed();
-
-                debug!(logger, "visited entity"; "path" => #?path, "duration" => #?duration, "result" => is_match);
-
-                if is_match {
+                for path in rx {
                     match_count += 1;
-                    on_match(path);
+                    on_match(&path);
                 }
+            });
+            if let Some(payload) = worker_panic.into_inner().unwrap() {
+                panic::resume_unwind(payload);
             }
 
             if match_count == 0 {
@@ -148,4 +156,33 @@ pub async fn parse_and_run_fs<F: FnMut(&Path)>(
         }
         Err(err) => Err(err),
     }
+}
+
+/// Evaluate `expr` against one entry, treating I/O errors as a non-match
+fn visit(
+    logger: &Logger,
+    expr: &Expr<Predicate<NamePredicate, MetadataPredicate, StreamingCompiledContentPredicateRef>>,
+    path: &Path,
+    root: &Path,
+    follow_links: bool,
+) -> bool {
+    let start = Instant::now();
+
+    let is_match = match eval::fs::eval(logger, expr, path, Some(root), follow_links) {
+        Ok(result) => result,
+        Err(e) => {
+            // Handle I/O errors gracefully - skip files we can't access
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                debug!(logger, "skipping file due to permission denied"; "path" => #?path);
+            } else {
+                // For other I/O errors, also skip but log at warning level
+                warn!(logger, "skipping file due to I/O error"; "path" => #?path, "error" => %e);
+            }
+            return false;
+        }
+    };
+
+    let duration = start.elapsed();
+    debug!(logger, "visited entity"; "path" => #?path, "duration" => #?duration, "result" => is_match);
+    is_match
 }

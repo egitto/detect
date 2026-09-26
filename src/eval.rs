@@ -2,16 +2,15 @@ use crate::expr::short_circuit::ShortCircuit;
 use crate::expr::Expr;
 use crate::predicate::{Predicate, StreamingCompiledContentPredicateRef};
 use crate::util::Done;
-use futures::{Stream, StreamExt};
 use regex_automata::dfa::Automaton;
-use tokio::io::{self};
+use std::io::{self, Read};
 
 pub mod fs;
 pub mod structured;
 
-pub async fn run_contents_predicate_stream(
+pub fn run_contents_predicate(
     e: Expr<Predicate<Done, Done, StreamingCompiledContentPredicateRef<'_>>>,
-    mut s: impl Stream<Item = io::Result<Vec<u8>>> + std::marker::Unpin,
+    mut reader: impl Read,
 ) -> io::Result<Expr<Predicate<Done, Done, Done>>> {
     let config = regex_automata::util::start::Config::new();
 
@@ -27,12 +26,18 @@ pub async fn run_contents_predicate_stream(
         _ => unreachable!(),
     });
 
-    while let Some(next) = s.next().await {
-        // read the next buffered chunk of bytes
-        let bytes = next?;
+    let mut buf = vec![0; 64 * 1024];
+    loop {
+        // read the next chunk of bytes
+        let bytes = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => &buf[..n],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
 
         // advance each pattern appropriately
-        e = e.reduce_predicate_and_short_circuit(move |p| match p {
+        e = e.reduce_predicate_and_short_circuit(|p| match p {
             Predicate::Content((dfa, state)) => {
                 // DFA streaming processing
                 let mut next_state = state;
@@ -56,6 +61,9 @@ pub async fn run_contents_predicate_stream(
             }
             _ => unreachable!(),
         });
+        if matches!(e, Expr::Literal(_)) {
+            break;
+        }
     }
 
     // Final evaluation

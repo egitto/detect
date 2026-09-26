@@ -10,10 +10,11 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Directories are walked and files evaluated in parallel, with synchronous file I/O (e.g. content search over ~1GB/54k files: ~9s → ~0.25s on 24 cores). Output order is no longer deterministic.
 - Symlinks are no longer implicitly followed when evaluating predicates: `type == symlink` now matches links, and content/structured predicates don't match them unless `-L` is passed
 - `created` now uses the file's birth time instead of inode change time; its `ctime` alias is replaced by `btime`
 - Timestamp comparisons use sub-second precision
-- Library API: `RuntimeConfig` has a new `follow_links` field (struct literals need `..Default::default()`), `eval::fs::eval` takes a `follow_links` argument, and `TimeMatcher::is_match` takes a `SystemTime`
+- Library API: `RuntimeConfig` has a new `follow_links` field (struct literals need `..Default::default()`), `eval::fs::eval` is synchronous and takes a `follow_links` argument, `eval::run_contents_predicate_stream` is replaced by the synchronous `run_contents_predicate` over any `Read`, and `TimeMatcher::is_match` takes a `SystemTime`
 
 ### Fixed
 
